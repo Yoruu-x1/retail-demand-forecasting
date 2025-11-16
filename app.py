@@ -195,4 +195,3 @@ if st.button("Forecast"):
     st.line_chart(plot_df.set_index('Date')['value'])
 
     st.success("Done.")
-``
