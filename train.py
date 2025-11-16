@@ -1,205 +1,123 @@
+# train.py
+import os
+import json
+import joblib
 import pandas as pd
 import numpy as np
-import os
-import joblib
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import lightgbm as lgb
-from datetime import timedelta
+from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from xgboost import XGBRegressor
 
-DATA_PATH = "Retail_Dataset2.csv"
-MODEL_PATH = "model.pkl"
 ARTIFACTS_DIR = "artifacts"
 os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
-def load_data(path=DATA_PATH):
-    """Load dataset mentah dari file CSV."""
-    df = pd.read_csv(path)
-    return df
+DATA_PATH = "Retail_Dataset2.csv"  # pastikan nama file sesuai
 
-# CLEANING DATA & AGGREGATION
-def clean_and_aggregate(df):
-    """
-    Membersihkan data, konversi tanggal, membersihkan Order_Demand,
-    lalu agregasi menjadi total sales per hari per produk per gudang.
-    """
+print("Loading dataset...")
+df = pd.read_csv(DATA_PATH)
 
-    # Convert kolom Date ke datetime 
-    df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
+print("Basic processing...")
+# date
+df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
 
-    # Membersihkan nilai Order_Demand
-    df['Order_Demand'] = (
-        df['Order_Demand'].astype(str)
-        .str.replace(',', '')   
-        .str.replace(' ', '')   
-        .replace('nan', np.nan) 
-    )
-    df['Order_Demand'] = pd.to_numeric(df['Order_Demand'], errors='coerce').fillna(0)
+# create date-derived features
+df["Year"] = df["Date"].dt.year
+df["Month"] = df["Date"].dt.month
+df["Day"] = df["Date"].dt.day
+df["DayOfWeek"] = df["Date"].dt.dayofweek
 
-    # Agregasi ke level time series: satu baris per hari per product/warehouse/category
-    agg = df.groupby(
-        ['Date', 'Product_Code', 'Warehouse', 'Product_Category'],
-        as_index=False
-    )['Order_Demand'].sum().rename(columns={'Order_Demand': 'sales'})
+# target
+TARGET = "Order_Demand"
 
-    return agg
+# define columns we will use (fixed order important)
+FEATURE_ORDER = [
+    "Open", "Promo", "SchoolHoliday", "Petrol_price",
+    "Year", "Month", "Day", "DayOfWeek",
+    "Product_Code", "Warehouse", "Product_Category", "StateHoliday"
+]
 
-# FEATURE ENGINEERING
-def create_features(df):
-    """
-    Membuat fitur-fitur time series:
-    - fitur kalender
-    - rata-rata sales per produk
-    - label encoding untuk kategori
-    - lag features (1,7,14,28 hari)
-    - rolling features (mean, std, min, max)
-    - trend index
-    """
+# keep only existing features (safe)
+FEATURE_ORDER = [f for f in FEATURE_ORDER if f in df.columns]
 
-    df = df.sort_values('Date').copy()
+# ------------ handle missing values ------------
+# categorical fillna -> 'MISSING'
+cat_cols = ["Product_Code", "Warehouse", "Product_Category", "StateHoliday"]
+for c in cat_cols:
+    if c in df.columns:
+        df[c] = df[c].astype(str).fillna("MISSING")
 
-    # ======== Fitur tanggal ========
-    df['day'] = df['Date'].dt.day
-    df['month'] = df['Date'].dt.month
-    df['year'] = df['Date'].dt.year
-    df['dayofweek'] = df['Date'].dt.dayofweek
-    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+# numeric fillna -> 0 (or median could be used)
+num_cols = [c for c in FEATURE_ORDER if c not in cat_cols]
+df[num_cols] = df[num_cols].fillna(0)
 
-    # ======== Statistik rata-rata per produk ========
-    prod_mean = df.groupby('Product_Code')['sales'].mean().rename('prod_sales_mean')
-    df = df.merge(prod_mean, on='Product_Code', how='left')
+# sanity: drop rows where target is missing or not numeric
+df = df[pd.to_numeric(df[TARGET], errors="coerce").notnull()].copy()
+df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce").fillna(0)
 
-    # ======== Label Encoding untuk kategori ========
-    le_wh = LabelEncoder()
-    df['Warehouse_le'] = le_wh.fit_transform(df['Warehouse'])
+# ------------ encode categoricals as integer mapping (and save mapping) ------------
+encoders = {}
+for c in cat_cols:
+    if c in FEATURE_ORDER:
+        vals = df[c].astype(str).tolist()
+        # get unique preserving order of appearance for stable mapping
+        uniq = list(dict.fromkeys(vals))
+        mapping = {v: i for i, v in enumerate(uniq)}
+        # map and store mapping + fallback mode
+        df[c] = df[c].astype(str).map(mapping).fillna(0).astype(int)
+        # mode (most frequent original string) for fallback
+        mode_val = df[c].mode()
+        # but we need original mode string:
+        # compute original mode by value counts on original vals
+        original_mode = pd.Series(vals).mode().iloc[0] if len(vals) > 0 else uniq[0]
+        encoders[c] = {"mapping": mapping, "mode": original_mode}
 
-    le_cat = LabelEncoder()
-    df['Product_Category_le'] = le_cat.fit_transform(df['Product_Category'])
+# save encoders as JSON (mapping keys are strings)
+with open(os.path.join(ARTIFACTS_DIR, "encoders.json"), "w", encoding="utf-8") as fh:
+    json.dump(encoders, fh, ensure_ascii=False)
 
-    # ======== Buat lag & rolling per kombinasi (produk, gudang) ========
-    df_list = []
-    for (prod, wh), g in df.groupby(['Product_Code', 'Warehouse']):
-        g = g.sort_values('Date').set_index('Date')
+# save feature order
+with open(os.path.join(ARTIFACTS_DIR, "features_order.json"), "w") as fh:
+    json.dump(FEATURE_ORDER, fh)
 
-        # ----- Fitur Lag -----
-        g['lag_1']  = g['sales'].shift(1)
-        g['lag_7']  = g['sales'].shift(7)
-        g['lag_14'] = g['sales'].shift(14)
-        g['lag_28'] = g['sales'].shift(28)
+# ------------ train/test split & model training ------------
+X = df[FEATURE_ORDER].copy()
+y = df[TARGET].copy()
 
-        # ----- Rolling Mean -----
-        g['rmean_7']  = g['sales'].shift(1).rolling(7).mean()
-        g['rmean_28'] = g['sales'].shift(1).rolling(28).mean()
+print("Splitting data...")
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
 
-        # ----- Rolling Std, Min, Max -----
-        g['rstd_7']  = g['sales'].shift(1).rolling(7).std().fillna(0)
-        g['rstd_28'] = g['sales'].shift(1).rolling(28).std().fillna(0)
-        g['rmin_7']  = g['sales'].shift(1).rolling(7).min().fillna(0)
-        g['rmax_7']  = g['sales'].shift(1).rolling(7).max().fillna(0)
+print("Training XGBoost...")
+model = XGBRegressor(
+    n_estimators=300,
+    learning_rate=0.05,
+    max_depth=6,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    tree_method="hist",
+    use_label_encoder=False,
+    eval_metric="rmse",
+    random_state=42,
+    n_jobs=-1
+)
+model.fit(X_train, y_train)
 
-        # ----- Trend Index -----
-        g['trend'] = np.arange(len(g))
+# evaluate
+preds = model.predict(X_test)
+rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
+mae = float(mean_absolute_error(y_test, preds))
+r2 = float(r2_score(y_test, preds))
 
-        df_list.append(g.reset_index())
+print(f"Evaluation on test set -> RMSE: {rmse:.2f}, MAE: {mae:.2f}, R2: {r2:.4f}")
 
-    res = pd.concat(df_list, axis=0).reset_index(drop=True)
+# save model (joblib)
+joblib.dump(model, os.path.join(ARTIFACTS_DIR, "model.pkl"))
+# also copy model to root for compatibility
+joblib.dump(model, "model.pkl")
 
-    # Hapus baris yang tidak memiliki lag (karena NA)
-    res = res.dropna(subset=['lag_1', 'lag_7', 'lag_14', 'lag_28', 'rmean_7', 'rmean_28'])
+# save simple eval summary
+with open(os.path.join(ARTIFACTS_DIR, "metrics.json"), "w") as fh:
+    json.dump({"rmse": rmse, "mae": mae, "r2": r2}, fh)
 
-    return res, le_wh, le_cat
-
-
-# ============================================================
-# MODEL TRAINING
-# ============================================================
-def train_model(df, le_wh, le_cat):
-    """Melatih LightGBM menggunakan fitur time series."""
-
-    # Daftar fitur final untuk training
-    features = [
-        'day', 'month', 'year', 'dayofweek', 'is_weekend',
-        'prod_sales_mean', 'Warehouse_le', 'Product_Category_le',
-        'lag_1', 'lag_7', 'lag_14', 'lag_28',
-        'rmean_7', 'rmean_28',
-        'rstd_7', 'rstd_28', 'rmin_7', 'rmax_7',
-        'trend'
-    ]
-
-    target = 'sales'
-    df = df.sort_values('Date')
-
-    # ======== Time-based Train/Test Split (30 hari terakhir sebagai test) ========
-    last_date = df['Date'].max()
-    cutoff = last_date - timedelta(days=30)
-
-    train_df = df[df['Date'] <= cutoff].copy()
-    test_df  = df[df['Date'] > cutoff].copy()
-
-    X_train = train_df[features]
-    y_train = train_df[target]
-    X_test  = test_df[features]
-    y_test  = test_df[target]
-
-    # ======== LightGBM Dataset ========
-    lgb_train = lgb.Dataset(X_train, label=y_train.values)
-    lgb_eval  = lgb.Dataset(X_test,  label=y_test.values)
-
-    # ======== Parameter Model ========
-    params = {
-        'objective': 'regression',
-        'metric': 'rmse',
-        'boosting_type': 'gbdt',
-        'num_leaves': 31,
-        'learning_rate': 0.05,
-        'seed': 42,
-        'verbosity': -1
-    }
-
-    # ======== Train LightGBM (with early stopping) ========
-    model = lgb.train(
-        params,
-        lgb_train,
-        num_boost_round=1000,
-        valid_sets=[lgb_train, lgb_eval],
-        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)]
-    )
-
-    # ======== Evaluasi ========
-    preds = model.predict(X_test, num_iteration=model.best_iteration)
-
-    mae  = mean_absolute_error(y_test, preds)
-    rmse = np.sqrt(mean_squared_error(y_test, preds))
-    mape = (np.abs((y_test - preds) / y_test.replace(0,1))).mean() * 100
-
-    print(f"MAE: {mae:.4f} | RMSE: {rmse:.4f} | MAPE: {mape:.2f}%")
-
-    # ======== Simpan model & encoder ========
-    save_path = os.path.join(ARTIFACTS_DIR, MODEL_PATH)
-    joblib.dump(model, save_path)
-    joblib.dump(le_wh,  os.path.join(ARTIFACTS_DIR, 'le_wh.pkl'))
-    joblib.dump(le_cat, os.path.join(ARTIFACTS_DIR, 'le_cat.pkl'))
-
-    # Simpan dataset hasil feature engineering
-    df.to_csv(os.path.join(ARTIFACTS_DIR, 'processed.csv'), index=False)
-
-    print("MODEL SAVED:", save_path)
-
-    return model
-
-def main():
-    print("\n=== LOADING DATA ===")
-    df = load_data()
-
-    print("=== CLEAN & AGGREGATE ===")
-    agg = clean_and_aggregate(df)
-
-    print("=== FEATURE ENGINEERING ===")
-    df_feat, le_wh, le_cat = create_features(agg)
-
-    print("=== TRAINING MODEL ===")
-    train_model(df_feat, le_wh, le_cat)
-
-
-if __name__ == "__main__":
-    main()
+print("Saved artifacts to", ARTIFACTS_DIR)
+print("TRAINING COMPLETE.")

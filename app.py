@@ -1,197 +1,127 @@
+# app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
+import json
 import joblib
-from datetime import timedelta
+import os
+from datetime import datetime
+
+st.set_page_config(page_title="Retail Demand Forecasting", layout="wide")
 
 ARTIFACTS_DIR = "artifacts"
-MODEL_PATH = "model.pkl"
+MODEL_PATH = os.path.join(ARTIFACTS_DIR, "model.pkl")
+ENCODERS_PATH = os.path.join(ARTIFACTS_DIR, "encoders.json")
+FEATURES_PATH = os.path.join(ARTIFACTS_DIR, "features_order.json")
 
-@st.cache_data
+# Load model + encoders + feature order
+@st.cache_resource
 def load_artifacts():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError("Model file not found: artifacts/model.pkl. Jalankan train.py dulu.")
+    model = joblib.load(MODEL_PATH)
+    with open(FEATURES_PATH, "r") as fh:
+        features = json.load(fh)
+    with open(ENCODERS_PATH, "r", encoding="utf-8") as fh:
+        encoders = json.load(fh)
+    return model, features, encoders
+
+try:
+    model, FEATURES_ORDER, ENCODERS = load_artifacts()
+except Exception as e:
+    st.error("Artifacts load error: " + str(e))
+    st.stop()
+
+st.title("📦 Retail Demand Forecasting — Demo")
+st.markdown(
     """
-    Memuat model, label encoder, dan processed dataset.
-    Streamlit cache memastikan file tidak dimuat berulang ulang.
+    **Petunjuk singkat**:
+    - Masukkan detail produk dan kondisi toko.
+    - Pilih tanggal (digunakan untuk mengekstrak Year/Month/Day/DayOfWeek).
+    - `StateHoliday` values:
+      - **0** = Bukan hari libur (hari kerja biasa)
+      - **a** = Hari libur nasional (contoh: Tahun Baru, Hari Kemerdekaan)
+      - **b** = Hari besar keagamaan (contoh: Natal, Idul Fitri)
+      - **MISSING** = data tidak tersedia
     """
-    bundle = joblib.load(f"{ARTIFACTS_DIR}/{MODEL_PATH}")
+)
 
-    if isinstance(bundle, dict):
-        model = bundle["model"]
-        le_wh = bundle["le_wh"]
-        le_cat = bundle["le_cat"]
-    else:
-       
-        model = bundle
-        le_wh = joblib.load(f"{ARTIFACTS_DIR}/le_wh.pkl")
-        le_cat = joblib.load(f"{ARTIFACTS_DIR}/le_cat.pkl")
+with st.form("predict_form"):
+    col1, col2 = st.columns(2)
 
-    processed = pd.read_csv(
-        f"{ARTIFACTS_DIR}/processed.csv",
-        parse_dates=['Date']
-    )
+    with col1:
+        product_code = st.text_input("Product Code", value="Product_0033")
+        warehouse = st.text_input("Warehouse", value="Whse_S")
+        product_category = st.text_input("Product Category", value="Category_005")
+        stateholiday = st.selectbox("StateHoliday", options=["0", "a", "b", "MISSING"])
 
-    return model, le_wh, le_cat, processed
+    with col2:
+        open_flag = st.selectbox("Open (1 buka / 0 tutup)", [1, 0], index=0)
+        promo = st.selectbox("Promo (1 = ada)", [0, 1], index=0)
+        school_holiday = st.selectbox("SchoolHoliday (1 = libur sekolah)", [0, 1], index=0)
+        petrol_price = st.number_input("Petrol_price (contoh: 90)", min_value=0, value=90, step=1)
 
-# FEATURE BUILDER
-def build_feature_row(df_hist, product_code, warehouse, product_category, pred_date):
-    """
-    Membangun 1 baris fitur untuk tanggal prediksi tertentu.
-    Menggunakan data historis + lag + rolling windows + trend.
-    """
+    date_input = st.date_input("Tanggal (dipakai utk Year/Month/Day/DayOfWeek)", value=datetime(2016,1,5))
 
-    # Ambil data historis per Product + Warehouse
-    ser = df_hist[
-        (df_hist['Product_Code'] == product_code) &
-        (df_hist['Warehouse'] == warehouse)
-    ].sort_values('Date')
+    submit = st.form_submit_button("Predict")
 
-    # Mapping tanggal → sales untuk akses cepat lag
-    sales_map = ser.set_index('Date')['sales'].to_dict()
+if submit:
+    # build input dict with exact feature order used in training
+    Year = date_input.year
+    Month = date_input.month
+    Day = date_input.day
+    DayOfWeek = date_input.weekday()
 
-    # Helper untuk mengambil data lag, return 0 jika missing
-    def get_lag(days):
-        d = pred_date - timedelta(days=days)
-        return sales_map.get(d, 0)
+    # start with zeros
+    input_dict = {f: 0 for f in FEATURES_ORDER}
 
-    # Window rolling (7 & 28 hari)
-    last_7 = [sales_map.get(pred_date - timedelta(days=d), 0) for d in range(1, 8)]
-    last_28 = [sales_map.get(pred_date - timedelta(days=d), 0) for d in range(1, 29)]
+    # fill numeric/date fields (names must match those in FEATURES_ORDER)
+    for k in ["Open", "Promo", "SchoolHoliday", "Petrol_price", "Year", "Month", "Day", "DayOfWeek"]:
+        if k in input_dict:
+            input_dict[k] = {
+                "Open": int(open_flag),
+                "Promo": int(promo),
+                "SchoolHoliday": int(school_holiday),
+                "Petrol_price": float(petrol_price),
+                "Year": int(Year),
+                "Month": int(Month),
+                "Day": int(Day),
+                "DayOfWeek": int(DayOfWeek)
+            }[k]
 
-    # Trend = jumlah hari historis → semakin panjang histori semakin stabil
-    trend_value = len(ser)
+    # map categoricals using saved encoders mapping; fallback to mode if unseen
+    for cat_col, user_val in [
+        ("Product_Code", product_code),
+        ("Warehouse", warehouse),
+        ("Product_Category", product_category),
+        ("StateHoliday", stateholiday)
+    ]:
+        if cat_col not in input_dict:
+            continue
+        enc = ENCODERS.get(cat_col)
+        if enc is None:
+            # no encoder saved (shouldn't happen) -> treat as 0
+            input_dict[cat_col] = 0
+        else:
+            mapping = enc["mapping"]
+            mode_string = enc.get("mode")
+            # if exact user_val in mapping use it, else fallback to mode_string
+            if str(user_val) in mapping:
+                input_dict[cat_col] = mapping[str(user_val)]
+            else:
+                # fallback
+                fallback = mode_string if mode_string in mapping else list(mapping.keys())[0]
+                input_dict[cat_col] = mapping.get(str(fallback), 0)
 
-    # 19 fitur sesuai training
-    row = {
-        # --- Date features ---
-        'day': pred_date.day,
-        'month': pred_date.month,
-        'year': pred_date.year,
-        'dayofweek': pred_date.dayofweek,
-        'is_weekend': int(pred_date.dayofweek in [5, 6]),
+    # build dataframe in exact order
+    X_input = pd.DataFrame([input_dict], columns=FEATURES_ORDER)
 
-        # --- Statistical info per product ---
-        'prod_sales_mean': ser['prod_sales_mean'].iloc[-1] if len(ser) > 0 else 0,
+    st.write("### Final input (sent to model)")
+    st.dataframe(X_input.T.rename(columns={0: "value"}))
 
-        # --- Encoded categorical ---
-        'Warehouse_le': ser['Warehouse_le'].iloc[-1] if len(ser) > 0 else 0,
-        'Product_Category_le': ser['Product_Category_le'].iloc[-1] if len(ser) > 0 else 0,
-
-        # --- Lags ---
-        'lag_1': get_lag(1),
-        'lag_7': get_lag(7),
-        'lag_14': get_lag(14),
-        'lag_28': get_lag(28),
-
-        # --- Rolling means ---
-        'rmean_7': np.mean(last_7),
-        'rmean_28': np.mean(last_28),
-
-        # --- Rolling statistical (std/min/max) ---
-        'rstd_7': np.std(last_7),
-        'rstd_28': np.std(last_28),
-        'rmin_7': min(last_7),
-        'rmax_7': max(last_7),
-
-        # --- Trend ---
-        'trend': trend_value,
-    }
-
-    return pd.DataFrame([row])
-
-# ITERATIVE FORECASTING
-def iterative_forecast(model, df_hist, product_code, warehouse, product_category, start_date, horizon):
-    """
-    Melakukan peramalan satu per satu.
-    Prediksi hari ke-n dipakai sebagai input lag untuk prediksi hari berikutnya.
-    Supaya cocok dengan real forecasting, bukan naive independent prediction.
-    """
-
-    features = [
-        'day','month','year','dayofweek','is_weekend',
-        'prod_sales_mean','Warehouse_le','Product_Category_le',
-        'lag_1','lag_7','lag_14','lag_28',
-        'rmean_7','rmean_28',
-        'rstd_7','rstd_28','rmin_7','rmax_7',
-        'trend'
-    ]
-
-    preds = []
-    cur_hist = df_hist.copy()   
-
-    for h in range(horizon):
-        pred_date = start_date + timedelta(days=h + 1)
-
-        X_row = build_feature_row(cur_hist, product_code, warehouse, product_category, pred_date)
-
-        X_row = X_row[features]
-
-        # Prediksi model
-        yhat = float(model.predict(X_row)[0])
-        yhat = max(0, yhat)  # untuk mencegah nilai negatif
-
-        # Simpan hasil prediksi
-        preds.append({'Date': pred_date, 'pred': yhat})
-
-        # Tambahkan prediksi sebagai data historis untuk iterasi selanjutnya
-        new_row = {
-            'Date': pred_date,
-            'Product_Code': product_code,
-            'Warehouse': warehouse,
-            'Product_Category': product_category,
-            'sales': yhat
-        }
-        cur_hist = pd.concat([cur_hist, pd.DataFrame([new_row])], ignore_index=True)
-
-    return pd.DataFrame(preds)
-
-# STREAMLIT UI
-st.set_page_config(page_title="Retail Demand Forecasting", layout="wide")
-st.title("Retail Demand Forecasting")
-
-model, le_wh, le_cat, processed = load_artifacts()
-
-products = sorted(processed['Product_Code'].unique().tolist())
-warehouses = sorted(processed['Warehouse'].unique().tolist())
-
-product_cat_map = processed.groupby('Product_Code')['Product_Category'].first().to_dict()
-
-# Input panel
-col1, col2, col3 = st.columns(3)
-with col1:
-    prod_sel = st.selectbox("Pilih Product Code", products)
-with col2:
-    wh_sel = st.selectbox("Pilih Warehouse", warehouses)
-with col3:
-    horizon = st.number_input("Days to forecast (1–30)", min_value=1, max_value=30, value=7)
-
-# Tanggal historical terakhir
-last_date = processed['Date'].max()
-st.write(f"Last historical date: **{last_date.date()}**")
-
-# FORECAST BUTTON
-if st.button("Forecast"):
-    category = product_cat_map.get(prod_sel, processed['Product_Category'].iloc[0])
-
-    # Jalankan iterative forecasting
-    preds_df = iterative_forecast(model, processed, prod_sel, wh_sel, category, last_date, horizon)
-
-    # Tampilkan tabel hasil
-    st.subheader("Forecast Results")
-    st.dataframe(preds_df.assign(pred=lambda d: d['pred'].round(2)))
-
-    # Ambil histori untuk plotting
-    hist = processed[
-        (processed['Product_Code'] == prod_sel) &
-        (processed['Warehouse'] == wh_sel)
-    ][['Date', 'sales']].sort_values('Date')
-
-    # Gabungkan histori + forecast untuk grafik
-    plot_df = pd.concat([
-        hist.rename(columns={'sales': 'value'}),
-        preds_df.rename(columns={'pred': 'value'})
-    ])
-
-    # Plot line chart
-    st.line_chart(plot_df.set_index('Date')['value'])
-
-    st.success("Done.")
+    # predict
+    try:
+        pred = model.predict(X_input)[0]
+        st.success(f"Predicted Order Demand: **{pred:,.2f}** units")
+    except Exception as e:
+        st.error("Model prediction error:")
+        st.code(str(e))

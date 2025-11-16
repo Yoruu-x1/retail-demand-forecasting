@@ -1,0 +1,1 @@
+{"best_model": "CatBoost", "rmse": 27783.45478060638, "features": ["Product_Code", "Warehouse", "Product_Category", "StateHoliday", "Open", "Promo", "SchoolHoliday", "Petrol_price", "Year", "Month", "Day", "DayOfWeek"]}
