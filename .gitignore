@@ -16,8 +16,6 @@ env/
 .vscode/
 .idea/
 
-artifacts/
-*.pkl
-*.joblib
+
 
 

@@ -146,7 +146,7 @@ def iterative_forecast(model, df_hist, product_code, warehouse, product_category
 
 # STREAMLIT UI
 st.set_page_config(page_title="Retail Demand Forecasting", layout="wide")
-st.title("Retail Demand Forecasting (Streamlit)")
+st.title("Retail Demand Forecasting")
 
 model, le_wh, le_cat, processed = load_artifacts()
 
