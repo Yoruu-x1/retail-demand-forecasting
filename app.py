@@ -31,12 +31,12 @@ except Exception as e:
     st.error("Artifacts load error: " + str(e))
     st.stop()
 
-st.title("📦 Retail Demand Forecasting — Demo")
+st.title("Retail Demand Forecasting")
 st.markdown(
     """
     **Petunjuk singkat**:
     - Masukkan detail produk dan kondisi toko.
-    - Pilih tanggal (digunakan untuk mengekstrak Year/Month/Day/DayOfWeek).
+    - Pilih tanggal
     - `StateHoliday` values:
       - **0** = Bukan hari libur (hari kerja biasa)
       - **a** = Hari libur nasional (contoh: Tahun Baru, Hari Kemerdekaan)
