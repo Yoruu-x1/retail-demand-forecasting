@@ -121,9 +121,12 @@ if submit:
     # predict
     try:
         pred = model.predict(X_input)[0]
-        if pred < 0: 
-            pred = 0
-        st.success(f"Predicted Order Demand: **{pred:,.2f}** units")
+
+
+        pred_display = abs(pred)
+
+        st.success(f"Predicted Order Demand: **{pred_display:,.2f}** units")
+
     except Exception as e:
         st.error("Model prediction error:")
         st.code(str(e))
